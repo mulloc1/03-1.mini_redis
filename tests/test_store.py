@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from mini_redis.errors import OOMError
-from tests.helpers import make_store
+from tests.helpers import FakeClock, make_store
 
 
 class TestStore(unittest.TestCase):
@@ -100,7 +100,7 @@ class TestStore(unittest.TestCase):
         store = make_store()
         store.set("x", "1")
         store.set("y", "2")
-        self.assertEqual(store.keys(), list(store._data.keys()))
+        self.assertEqual(store.keys(), list(store._entries.keys()))
 
 
 class TestStoreEviction(unittest.TestCase):
@@ -196,6 +196,138 @@ class TestStoreEviction(unittest.TestCase):
         self.assertEqual(store.dbsize(), 1)
         self.assertLessEqual(metrics.used_memory, metrics.maxmemory)
         self.assertEqual(metrics.evicted_keys, 1)
+
+
+class TestStoreTTL(unittest.TestCase):
+    def test_expire_missing_key_returns_zero(self) -> None:
+        # EXPIRE on a missing key returns 0 and leaves metrics unchanged.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        before = store.info_memory()
+        self.assertEqual(store.expire("missing", 10), 0)
+        after = store.info_memory()
+        self.assertEqual(after.used_memory, before.used_memory)
+        self.assertEqual(after.evicted_keys, before.evicted_keys)
+
+    def test_expire_non_positive_seconds_deletes_existing_key(self) -> None:
+        # EXPIRE with non-positive seconds immediately deletes existing keys.
+        store = make_store(clock=FakeClock())
+        store.set("a", "1")
+        store.set("b", "2")
+        self.assertEqual(store.expire("a", 0), 1)
+        self.assertEqual(store.expire("b", -3), 1)
+        self.assertEqual(store.dbsize(), 0)
+        metrics = store.info_memory()
+        self.assertEqual(metrics.used_memory, 0)
+        self.assertEqual(metrics.evicted_keys, 0)
+
+    def test_ttl_counts_down_with_ceil(self) -> None:
+        # TTL returns remaining seconds rounded up for fractional time.
+        clock = FakeClock(start=100.0)
+        store = make_store(clock=clock)
+        store.set("session", "abc")
+        self.assertEqual(store.expire("session", 10), 1)
+        self.assertEqual(store.ttl("session"), 10)
+        clock.advance(2.0)
+        self.assertEqual(store.ttl("session"), 8)
+        clock.advance(0.5)
+        self.assertEqual(store.ttl("session"), 8)
+
+    def test_ttl_return_values_for_missing_no_ttl_and_ttl(self) -> None:
+        # TTL returns -2 for missing, -1 for persistent, or remaining seconds.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        self.assertEqual(store.ttl("missing"), -2)
+        store.set("forever", "x")
+        self.assertEqual(store.ttl("forever"), -1)
+        store.expire("forever", 30)
+        self.assertEqual(store.ttl("forever"), 30)
+
+    def test_due_key_expires_on_public_commands(self) -> None:
+        # Public commands sweep due TTL entries before answering.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        store.set("a", "1")
+        store.set("b", "2")
+        store.expire("a", 5)
+        clock.advance(5)
+        self.assertEqual(store.exists("a"), 0)
+        self.assertEqual(store.dbsize(), 1)
+        self.assertEqual(store.keys(), ["b"])
+        self.assertIsNone(store.get("a"))
+        self.assertEqual(store.info_memory().evicted_keys, 0)
+
+    def test_get_expired_key_does_not_promote_lru(self) -> None:
+        # GET on an expired key deletes it without promoting it in the LRU list.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        store.set("a", "1")
+        store.set("b", "2")
+        store.expire("a", 1)
+        assert store._lru.head is not None
+        assert store._lru.tail is not None
+        self.assertEqual(store._lru.head.data, "b")
+        self.assertEqual(store._lru.tail.data, "a")
+        clock.advance(1)
+        self.assertIsNone(store.get("a"))
+        assert store._lru.head is not None
+        assert store._lru.tail is not None
+        self.assertEqual(store._lru.head.data, "b")
+        self.assertEqual(store._lru.tail.data, "b")
+
+    def test_expire_update_discards_stale_heap_entry(self) -> None:
+        # Re-EXPIRE leaves the old heap record stale until a later sweep.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        store.set("k", "v")
+        store.expire("k", 10)
+        clock.advance(5)
+        store.expire("k", 20)
+        clock.advance(6)
+        self.assertEqual(store.exists("k"), 1)
+        self.assertEqual(store.get("k"), "v")
+        clock.advance(14)
+        self.assertEqual(store.exists("k"), 0)
+
+    def test_set_overwrite_clears_existing_ttl(self) -> None:
+        # SET overwrite clears the previous TTL and leaves the new value persistent.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        store.set("k", "v1")
+        store.expire("k", 60)
+        store.set("k", "v2")
+        self.assertEqual(store.ttl("k"), -1)
+        clock.advance(120)
+        self.assertEqual(store.exists("k"), 1)
+        self.assertEqual(store.get("k"), "v2")
+
+    def test_delete_leaves_stale_heap_record_until_sweep(self) -> None:
+        # DEL removes authoritative data while the stale heap record is swept later.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        store.set("k", "v")
+        store.expire("k", 10)
+        self.assertEqual(store._ttl_heap.size(), 1)
+        self.assertEqual(store.delete("k"), 1)
+        self.assertEqual(store._ttl_heap.size(), 1)
+        clock.advance(10)
+        self.assertEqual(store.dbsize(), 0)
+        self.assertEqual(store._ttl_heap.size(), 0)
+
+    def test_ttl_expiration_can_avoid_lru_eviction_under_maxmemory(self) -> None:
+        # Expiring due keys before SET can free memory without LRU eviction.
+        clock = FakeClock()
+        store = make_store(clock=clock)
+        store.set_maxmemory(10)
+        store.set("a", "1111")
+        store.set("b", "2222")
+        store.expire("a", 1)
+        clock.advance(1)
+        store.set("c", "3333")
+        self.assertEqual(store.exists("a"), 0)
+        self.assertEqual(store.exists("b"), 1)
+        self.assertEqual(store.exists("c"), 1)
+        self.assertEqual(store.info_memory().evicted_keys, 0)
 
 
 if __name__ == "__main__":
