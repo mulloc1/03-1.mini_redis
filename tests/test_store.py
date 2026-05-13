@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from mini_redis.errors import OOMError
 from tests.helpers import make_store
 
 
@@ -100,6 +101,101 @@ class TestStore(unittest.TestCase):
         store.set("x", "1")
         store.set("y", "2")
         self.assertEqual(store.keys(), list(store._data.keys()))
+
+
+class TestStoreEviction(unittest.TestCase):
+    def test_set_maxmemory_zero_is_unlimited(self) -> None:
+        # maxmemory=0 keeps unlimited mode and never increments evicted_keys.
+        store = make_store()
+        store.set_maxmemory(0)
+        for i in range(20):
+            store.set(f"k{i}", "value")
+        metrics = store.info_memory()
+        self.assertEqual(metrics.maxmemory, 0)
+        self.assertEqual(metrics.evicted_keys, 0)
+        self.assertEqual(store.dbsize(), 20)
+
+    def test_set_maxmemory_negative_raises(self) -> None:
+        # Negative maxmemory is rejected at store layer.
+        store = make_store()
+        with self.assertRaises(ValueError):
+            store.set_maxmemory(-1)
+
+    def test_set_evicts_lru_back_when_exceeded(self) -> None:
+        # LRU tail key is evicted first when SET pushes used_memory over limit.
+        store = make_store()
+        store.set_maxmemory(16)
+        store.set("a", "xxxx")
+        store.set("b", "yyyy")
+        store.set("c", "zzzz")
+        self.assertEqual(store.get("a"), "xxxx")
+        store.set("d", "wwww")
+        self.assertEqual(store.exists("b"), 0)
+        self.assertEqual(store.exists("a"), 1)
+        self.assertEqual(store.exists("c"), 1)
+        self.assertEqual(store.exists("d"), 1)
+        self.assertEqual(store.info_memory().evicted_keys, 1)
+
+    def test_eviction_continues_until_under_limit(self) -> None:
+        # Eviction loop removes multiple keys until memory returns under limit.
+        store = make_store()
+        store.set_maxmemory(10)
+        store.set("a", "123")
+        store.set("b", "123")
+        store.set("c", "123")
+        store.set("d", "123")
+        metrics = store.info_memory()
+        self.assertLessEqual(metrics.used_memory, metrics.maxmemory)
+        self.assertGreaterEqual(metrics.evicted_keys, 2)
+
+    def test_evicted_keys_accumulates(self) -> None:
+        # evicted_keys tracks cumulative number of LRU-policy evictions.
+        store = make_store()
+        store.set_maxmemory(12)
+        store.set("a", "xxxx")
+        store.set("b", "yyyy")
+        store.set("c", "zzzz")
+        first = store.info_memory().evicted_keys
+        store.set("d", "wwww")
+        second = store.info_memory().evicted_keys
+        self.assertGreaterEqual(first, 1)
+        self.assertGreater(second, first)
+
+    def test_single_entry_over_maxmemory_raises_oom(self) -> None:
+        # A single oversized entry is rejected with OOM and no mutation.
+        store = make_store()
+        store.set_maxmemory(4)
+        with self.assertRaises(OOMError):
+            store.set("hello", "world")
+        self.assertEqual(store.dbsize(), 0)
+        self.assertEqual(store.info_memory().used_memory, 0)
+
+    def test_oom_does_not_mutate_existing_state(self) -> None:
+        # OOM during SET preserves existing keys, memory, and LRU order.
+        store = make_store()
+        store.set_maxmemory(7)
+        store.set("a", "1111")
+        before_memory = store.info_memory().used_memory
+        assert store._lru.head is not None
+        before_head = store._lru.head.data
+        with self.assertRaises(OOMError):
+            store.set("hello", "world")
+        self.assertEqual(store.get("a"), "1111")
+        self.assertEqual(store.info_memory().used_memory, before_memory)
+        assert store._lru.head is not None
+        self.assertEqual(store._lru.head.data, before_head)
+
+    def test_config_set_maxmemory_below_usage_evicts(self) -> None:
+        # Lowering maxmemory below current usage triggers immediate eviction.
+        store = make_store()
+        store.set("a", "xxxx")
+        store.set("b", "yyyy")
+        self.assertEqual(store.dbsize(), 2)
+        store.set_maxmemory(5)
+        metrics = store.info_memory()
+        self.assertEqual(store.dbsize(), 1)
+        self.assertLessEqual(metrics.used_memory, metrics.maxmemory)
+        self.assertEqual(metrics.evicted_keys, 1)
 
 
 if __name__ == "__main__":

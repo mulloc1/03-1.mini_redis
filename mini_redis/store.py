@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from mini_redis.errors import OOMError
 from mini_redis.hashmap import HashMap
 from mini_redis.heap import MinHeap
 from mini_redis.linked_list import DoublyLinkedList, Node
@@ -58,13 +59,37 @@ class Store:
         self._lru.remove_node(entry.lru_node)
         self._metrics.used_memory -= entry.entry_bytes
 
+    def _enforce_maxmemory(self) -> None:
+        """Evict least recently used keys until used_memory <= maxmemory."""
+        while (
+            self._metrics.maxmemory > 0
+            and self._metrics.used_memory > self._metrics.maxmemory
+        ):
+            if self._lru.tail is None:
+                break
+            evicted_key = self._lru.remove_back()
+            raw = self._data.get(evicted_key)
+            assert isinstance(raw, Entry)
+            self._metrics.used_memory -= raw.entry_bytes
+            self._data.remove(evicted_key)
+            self._metrics.evicted_keys += 1
+
+    def set_maxmemory(self, bytes_: int) -> None:
+        """Set maxmemory in bytes; 0 means unlimited."""
+        if bytes_ < 0:
+            raise ValueError("maxmemory must be non-negative")
+        self._metrics.maxmemory = bytes_
+        self._enforce_maxmemory()
+
     def set(self, key: str, value: str) -> None:
         """Insert or replace *key* with *value*; update LRU and used_memory."""
+        entry_bytes = _utf8_len(key) + _utf8_len(value)
+        if self._metrics.maxmemory > 0 and entry_bytes > self._metrics.maxmemory:
+            raise OOMError("entry exceeds maxmemory")
         old = self._data.get(key)
         if isinstance(old, Entry):
             self._evict_entry(old)
         lru_node = self._lru.insert_front(key)
-        entry_bytes = _utf8_len(key) + _utf8_len(value)
         entry = Entry(
             key=key,
             value=value,
@@ -73,6 +98,7 @@ class Store:
         )
         self._data.put(key, entry)
         self._metrics.used_memory += entry_bytes
+        self._enforce_maxmemory()
 
     def get(self, key: str) -> str | None:
         """Return value for *key*, or None; on hit, promote key in LRU."""
