@@ -202,5 +202,104 @@ class TestRunRepl(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), PROMPT * 4)
 
 
+class TestDebugScenarios(unittest.TestCase):
+    def test_debug_lru_flow_with_step_snapshots(self) -> None:
+        # LRU 제거 흐름을 단계별 응답/메모리 상태로 추적 가능하게 검증한다.
+        store = make_store()
+        steps: list[tuple[str, str]] = [
+            ("CONFIG SET maxmemory 16", "OK"),
+            ('SET a "xxxx"', "OK"),
+            ('SET b "yyyy"', "OK"),
+            ('SET c "zzzz"', "OK"),
+            ("GET a", '"xxxx"'),
+            ('SET d "wwww"', "OK"),
+            ("EXISTS b", "(integer) 0"),
+            ("INFO memory", "used_memory:15\nmaxmemory:16\nevicted_keys:1"),
+        ]
+
+        transcript: list[tuple[str, str]] = []
+        for command, expected in steps:
+            actual = dispatch(store, command)
+            assert isinstance(actual, str)
+            transcript.append((command, actual))
+            self.assertEqual(actual, expected)
+
+        self.assertEqual(transcript, steps)
+
+    def test_debug_ttl_lifecycle_with_explicit_time_ticks(self) -> None:
+        # FakeClock tick 마다 TTL 값과 만료 여부를 눈으로 따라갈 수 있게 검증한다.
+        clock = FakeClock(start=10.0)
+        store = make_store(clock=clock)
+        dispatch(store, "SET session token")
+        dispatch(store, "EXPIRE session 3")
+
+        timeline: list[tuple[str, str]] = []
+        timeline.append(("t=10 TTL", dispatch(store, "TTL session")))
+        clock.advance(1.0)
+        timeline.append(("t=11 TTL", dispatch(store, "TTL session")))
+        clock.advance(1.1)
+        timeline.append(("t=12.1 TTL", dispatch(store, "TTL session")))
+        clock.advance(1.0)
+        timeline.append(("t=13.1 GET", dispatch(store, "GET session")))
+        timeline.append(("t=13.1 EXISTS", dispatch(store, "EXISTS session")))
+
+        self.assertEqual(
+            timeline,
+            [
+                ("t=10 TTL", "(integer) 3"),
+                ("t=11 TTL", "(integer) 2"),
+                ("t=12.1 TTL", "(integer) 1"),
+                ("t=13.1 GET", "(nil)"),
+                ("t=13.1 EXISTS", "(integer) 0"),
+            ],
+        )
+
+    def test_debug_repl_transcript_for_breakpoint_inspection(self) -> None:
+        # REPL 입력/출력 transcript를 한 번에 확인할 수 있게 검증한다.
+        store = make_store()
+        stdin_script = (
+            "SET user:1 Alice\n"
+            "GET user:1\n"
+            "EXPIRE user:1 1\n"
+            "TTL user:1\n"
+            "FOOBAR\n"
+            "exit\n"
+        )
+        stdin = io.StringIO(stdin_script)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        code = run_repl(store, stdin, stderr, stdout)
+        self.assertEqual(code, 0)
+
+        stdout_lines = stdout.getvalue().splitlines()
+        stderr_prompts = stderr.getvalue()
+        self.assertEqual(
+            stdout_lines,
+            [
+                "OK",
+                '"Alice"',
+                "(integer) 1",
+                "(integer) 1",
+                "(error) ERR unknown command 'FOOBAR'",
+            ],
+        )
+        self.assertEqual(stderr_prompts, PROMPT * 6)
+
+    def test_debug_error_matrix_for_dispatch(self) -> None:
+        # 에러 명령 매트릭스를 고정해 디버깅 시 실패 지점을 즉시 식별 가능하게 검증한다.
+        store = make_store()
+        cases: list[tuple[str, str]] = [
+            ("SET only_one_arg", "(error) ERR wrong number of arguments for 'set' command"),
+            ("EXPIRE a nope", "(error) ERR value is not an integer or out of range"),
+            ("CONFIG GET maxmemory", "(error) ERR unknown subcommand or wrong number of arguments for 'set'"),
+            ('SET a "unterminated', "(error) ERR unbalanced quotes in request"),
+        ]
+
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.assertEqual(dispatch(store, command), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
